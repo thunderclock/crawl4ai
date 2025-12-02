@@ -71,6 +71,9 @@ async def test_crawl():
     print("  3. Wait for you to login (if needed)")
     print("  4. Search for '牛奶'")
     print("  5. Crawl 2 notes")
+    print("\n💡 Browser State:")
+    print("  - Browser state will be saved for future runs")
+    print("  - Next time you run this, login will be automatic!")
     print("\nStarting in 5 seconds... (Press Ctrl+C to cancel)")
     
     try:
@@ -81,6 +84,14 @@ async def test_crawl():
     
     try:
         crawler = RedNoteCrawler()
+        print(f"\n📁 Browser state directory: {crawler.browser_data_dir}")
+        print(f"📁 Data storage directory: {crawler.storage_dir}")
+        
+        # Check if browser state already exists
+        if crawler.browser_data_dir.exists() and any(crawler.browser_data_dir.iterdir()):
+            print("✅ Found existing browser state - login should be automatic!")
+        else:
+            print("ℹ️  No existing browser state - you'll need to login this time")
         
         result = await crawler.run(
             search_keyword="牛奶",
@@ -106,6 +117,10 @@ async def test_crawl():
                 print(f"Images: {len(note.get('images', []))} images")
                 print(f"Text: {len(note.get('text', ''))} chars")
                 print(f"Comments: {len(note.get('comments', []))} comments")
+        
+        if data.get('success'):
+            print(f"\n💾 Browser state saved to: {crawler.browser_data_dir}")
+            print("   Next time you run this, login will be automatic!")
         
         return data.get('success', False)
         

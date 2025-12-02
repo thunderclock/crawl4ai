@@ -7,19 +7,22 @@ to crawl RedNote content with browser automation.
 
 import asyncio
 import json
-from crawl4ai import CrawlerHub
+import os
+from crawl4ai import CrawlerHub, LLMConfig
 from crawl4ai.crawlers.rednote.crawler import RedNoteCrawler
 
 
 async def example_1_direct_usage():
-    """Example 1: Direct usage of RedNoteCrawler"""
+    """Example 1: Direct usage of RedNoteCrawler (without LLM)"""
     print("=" * 60)
-    print("Example 1: Direct Usage")
+    print("Example 1: Direct Usage (CSS Selectors)")
     print("=" * 60)
     
-    # Create crawler instance
+    # Create crawler instance without LLM
     crawler = RedNoteCrawler(
-        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-url"
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-url",
+        use_llm_extraction=False,  # Use CSS selectors only
+        storage_dir="./rednote_data"  # Custom storage directory
     )
     
     # Run crawler
@@ -45,6 +48,61 @@ async def example_1_direct_usage():
     
     if data.get('error'):
         print(f"\nError: {data['error']}")
+    
+    if data.get('storage_dir'):
+        print(f"\nData saved to: {data['storage_dir']}")
+
+
+async def example_1b_with_llm():
+    """Example 1b: Direct usage with LLM extraction"""
+    print("=" * 60)
+    print("Example 1b: Direct Usage with LLM Extraction")
+    print("=" * 60)
+    
+    # Configure LLM (optional - only if you want intelligent extraction)
+    llm_config = LLMConfig(
+        provider="openai/gpt-4o-mini",  # or "ollama/llama2", etc.
+        api_token=os.getenv("OPENAI_API_KEY")  # Set your API key
+    )
+    
+    # Create crawler instance with LLM
+    crawler = RedNoteCrawler(
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-url",
+        llm_config=llm_config,
+        use_llm_extraction=True,  # Enable LLM extraction
+        storage_dir="./rednote_data_llm"  # Custom storage directory
+    )
+    
+    # Run crawler
+    result = await crawler.run(
+        search_keyword="牛奶",
+        max_notes=5,
+        headless=False,
+        verbose=True
+    )
+    
+    # Parse and display results
+    data = json.loads(result)
+    print(f"\nSuccess: {data.get('success')}")
+    print(f"Total notes crawled: {data.get('total_notes', 0)}")
+    
+    if data.get('notes'):
+        for i, note in enumerate(data['notes'], 1):
+            print(f"\n--- Note {i} ---")
+            print(f"URL: {note.get('url')}")
+            print(f"Title: {note.get('title', 'N/A')}")
+            print(f"Author: {note.get('author', 'N/A')}")
+            print(f"Images: {len(note.get('images', []))} images")
+            print(f"Text length: {len(note.get('text', ''))} characters")
+            print(f"Tags: {note.get('tags', [])}")
+            print(f"Comments: {len(note.get('comments', []))} comments")
+            print(f"Saved to: {note.get('saved_path', 'N/A')}")
+    
+    if data.get('error'):
+        print(f"\nError: {data['error']}")
+    
+    if data.get('storage_dir'):
+        print(f"\nData saved to: {data['storage_dir']}")
 
 
 async def example_2_hub_usage():
@@ -115,6 +173,51 @@ async def example_4_save_results():
         f.write(result)
     
     print(f"Results saved to {output_file}")
+
+
+async def example_5_persistent_browser_state():
+    """Example 5: Use persistent browser state to avoid re-login"""
+    print("\n" + "=" * 60)
+    print("Example 5: Persistent Browser State")
+    print("=" * 60)
+    print("\n💡 This example shows how to save browser state (cookies, login session)")
+    print("   so you don't need to login every time you run the crawler.")
+    print("\n📝 How it works:")
+    print("   1. First run: Login manually in the browser window")
+    print("   2. Browser state (cookies, localStorage) is saved to browser_data_dir")
+    print("   3. Next run: Browser automatically loads saved state, no login needed!")
+    print("=" * 60)
+    
+    # Option 1: Use default browser data directory (~/.crawl4ai/rednote_browser_profile)
+    crawler = RedNoteCrawler(
+        storage_dir="./rednote_data_persistent"
+        # browser_data_dir is optional - defaults to ~/.crawl4ai/rednote_browser_profile
+    )
+    
+    # Option 2: Use custom browser data directory
+    # crawler = RedNoteCrawler(
+    #     browser_data_dir="./my_rednote_browser_profile",  # Custom location
+    #     storage_dir="./rednote_data_persistent"
+    # )
+    
+    print(f"\n📁 Browser state directory: {crawler.browser_data_dir}")
+    print(f"📁 Data storage directory: {crawler.storage_dir}")
+    print("\n🚀 Starting crawler...")
+    print("   (If this is the first run, you'll need to login manually)")
+    print("   (On subsequent runs, login state will be automatically restored)")
+    
+    result = await crawler.run(
+        search_keyword="牛奶",
+        max_notes=5,
+        headless=False,  # Non-headless to see the browser
+        verbose=True
+    )
+    
+    data = json.loads(result)
+    print(f"\n✅ Success: {data.get('success')}")
+    print(f"📊 Total notes crawled: {data.get('total_notes', 0)}")
+    print(f"\n💾 Browser state saved to: {crawler.browser_data_dir}")
+    print("   Next time you run this, login will be automatic!")
 
 
 async def main():
@@ -194,6 +297,9 @@ async def main():
         print("\n" + "=" * 60)
         print("Test completed!")
         print("=" * 60)
+        print("\n💡 Tip: Browser state has been saved!")
+        print(f"   Next time you run this, login will be automatic.")
+        print(f"   Browser state location: {crawler.browser_data_dir}")
         
     except Exception as e:
         print(f"\n✗ Error during test: {str(e)}")
@@ -202,5 +308,20 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Uncomment the example you want to run:
+    
+    # Example 1: Basic usage without LLM (CSS selectors only)
+    # asyncio.run(example_1_direct_usage())
+    
+    # Example 1b: Usage with LLM extraction (requires API key)
+    # asyncio.run(example_1b_with_llm())
+    
+    # Example 2: Usage via CrawlerHub
+    # asyncio.run(example_2_hub_usage())
+    
+    # Example 5: Persistent browser state (saves login, no re-login needed)
+    # asyncio.run(example_5_persistent_browser_state())
+    
+    # Full crawl test
     asyncio.run(main())
 

@@ -13,10 +13,14 @@ import json
 import asyncio
 import aiohttp
 import random
+import os
+import tempfile
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
-from crawl4ai import BrowserConfig, AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from crawl4ai import BrowserConfig, AsyncWebCrawler, CrawlerRunConfig, CacheMode, LLMConfig
+from crawl4ai.extraction_strategy import LLMExtractionStrategy
 from crawl4ai.hub import BaseCrawler
 from crawl4ai.async_logger import AsyncLogger
 
@@ -39,12 +43,24 @@ __meta__ = {
 class RedNoteCrawler(BaseCrawler):
     """RedNote crawler with browser automation and verification handling"""
     
-    def __init__(self, feishu_webhook_url: Optional[str] = None):
+    def __init__(
+        self, 
+        feishu_webhook_url: Optional[str] = None,
+        llm_config: Optional[LLMConfig] = None,
+        use_llm_extraction: bool = True,
+        storage_dir: Optional[str] = None,
+        browser_data_dir: Optional[str] = None
+    ):
         """
         Initialize RedNote crawler
         
         Args:
             feishu_webhook_url: Feishu WebHook URL for captcha notifications
+            llm_config: LLM configuration for intelligent extraction (optional)
+            use_llm_extraction: Whether to use LLM for extraction (default: True)
+            storage_dir: Directory to store crawled data (default: temp directory)
+            browser_data_dir: Directory to store browser state (cookies, localStorage, etc.)
+                             If None, uses ~/.crawl4ai/rednote_browser_profile
         """
         super().__init__()
         self.feishu_webhook_url = feishu_webhook_url
@@ -52,6 +68,31 @@ class RedNoteCrawler(BaseCrawler):
         self.search_url = f"{self.base_url}/search_result"
         self.crawler: Optional[AsyncWebCrawler] = None
         self.page: Optional[Page] = None
+        self.llm_config = llm_config
+        self.use_llm_extraction = use_llm_extraction
+        
+        # Setup browser data directory for persistent context (saves login state)
+        if browser_data_dir:
+            self.browser_data_dir = Path(browser_data_dir)
+        else:
+            # Use default directory in user's home
+            home_dir = Path.home()
+            self.browser_data_dir = home_dir / ".crawl4ai" / "rednote_browser_profile"
+        
+        self.browser_data_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Browser state will be saved to: {self.browser_data_dir}")
+        
+        # Setup storage directory
+        if storage_dir:
+            self.storage_dir = Path(storage_dir)
+        else:
+            # Use temp directory with timestamp
+            temp_base = Path(tempfile.gettempdir()) / "rednote_crawler"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.storage_dir = temp_base / timestamp
+        
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Data will be stored in: {self.storage_dir}")
     
     async def _random_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Add random delay between 1-3 seconds (or custom range) to simulate human behavior"""
@@ -771,19 +812,165 @@ class RedNoteCrawler(BaseCrawler):
             traceback.print_exc()
             return False
     
+    def _get_rednote_schema(self) -> Dict[str, Any]:
+        """Get JSON schema for RedNote note extraction"""
+        return {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "笔记标题或主题"
+                },
+                "text": {
+                    "type": "string",
+                    "description": "笔记的完整文本内容"
+                },
+                "images": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "图片URL"
+                    },
+                    "description": "笔记中的所有图片URL列表"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "笔记中的标签或话题"
+                },
+                "comments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "评论内容"
+                            },
+                            "author": {
+                                "type": "string",
+                                "description": "评论作者用户名"
+                            },
+                            "likes": {
+                                "type": "integer",
+                                "description": "评论点赞数"
+                            },
+                            "time": {
+                                "type": "string",
+                                "description": "评论时间"
+                            }
+                        },
+                        "required": ["text"]
+                    },
+                    "description": "评论列表"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "笔记作者用户名"
+                },
+                "likes": {
+                    "type": "integer",
+                    "description": "笔记点赞数"
+                },
+                "collections": {
+                    "type": "integer",
+                    "description": "笔记收藏数"
+                }
+            },
+            "required": ["text", "images"]
+        }
+    
+    async def _extract_with_llm(self, page: Page, html_content: str) -> Optional[Dict[str, Any]]:
+        """Extract note data using LLM if configured"""
+        if not self.use_llm_extraction or not self.llm_config:
+            return None
+        
+        try:
+            self.logger.info("Using LLM for intelligent extraction...")
+            
+            # Create LLM extraction strategy
+            llm_strategy = LLMExtractionStrategy(
+                llm_config=self.llm_config,
+                schema=self._get_rednote_schema(),
+                extraction_type="schema",
+                instruction="""从RedNote（小红书）笔记页面中提取结构化数据。
+请仔细分析HTML内容，提取以下信息：
+1. 笔记的标题或主题
+2. 笔记的完整文本内容（去除HTML标签，保留纯文本）
+3. 所有图片的URL（排除头像、图标等小图片）
+4. 笔记中的标签或话题
+5. 所有评论信息（包括评论内容、作者、点赞数、时间）
+6. 笔记作者用户名
+7. 笔记的点赞数和收藏数
+
+请确保提取的数据准确完整，图片URL必须是完整的可访问URL。""",
+                apply_chunking=False,
+                force_json_response=True,
+                verbose=self.logger.verbose if hasattr(self.logger, 'verbose') else False
+            )
+            
+            # Extract using LLM
+            extracted = llm_strategy.extract(
+                url=page.url,
+                ix=0,
+                html=html_content
+            )
+            
+            if extracted and len(extracted) > 0:
+                # LLM returns a list, get the first result
+                result = extracted[0] if isinstance(extracted, list) else extracted
+                if isinstance(result, dict):
+                    self.logger.info("LLM extraction successful")
+                    return result
+            
+        except Exception as e:
+            self.logger.warning(f"LLM extraction failed, falling back to CSS selectors: {str(e)}")
+        
+        return None
+    
     async def _extract_note_data_from_popup(self, page: Page) -> Dict[str, Any]:
         """Extract data from popup/modal dialog (not from full page)"""
         note_data = {
             "url": page.url,
             "images": [],
             "text": "",
-            "comments": []
+            "comments": [],
+            "title": "",
+            "tags": [],
+            "author": "",
+            "likes": 0,
+            "collections": 0
         }
         
         try:
             # Wait for popup to appear
             await asyncio.sleep(1)
             
+            # Get page HTML for LLM extraction
+            html_content = await page.content()
+            
+            # Try LLM extraction first if enabled
+            if self.use_llm_extraction and self.llm_config:
+                llm_result = await self._extract_with_llm(page, html_content)
+                if llm_result:
+                    # Merge LLM results with note_data
+                    note_data.update({
+                        "title": llm_result.get("title", ""),
+                        "text": llm_result.get("text", ""),
+                        "images": llm_result.get("images", []),
+                        "tags": llm_result.get("tags", []),
+                        "comments": llm_result.get("comments", []),
+                        "author": llm_result.get("author", ""),
+                        "likes": llm_result.get("likes", 0),
+                        "collections": llm_result.get("collections", 0)
+                    })
+                    # If LLM extraction was successful, return early
+                    if note_data.get("text") or note_data.get("images"):
+                        return note_data
+            
+            # Fallback to CSS selector extraction if LLM failed or not enabled
             # Find popup/modal container
             popup_selectors = [
                 '.modal',
@@ -853,7 +1040,8 @@ class RedNoteCrawler(BaseCrawler):
                     if text and text.strip() and len(text.strip()) > 10:  # Filter out very short text
                         text_parts.append(text.strip())
                 
-                note_data["text"] = '\n'.join(text_parts)
+                if text_parts:
+                    note_data["text"] = '\n'.join(text_parts)
             except Exception as e:
                 self.logger.warning(f"Error extracting text from popup: {str(e)}")
             
@@ -899,6 +1087,32 @@ class RedNoteCrawler(BaseCrawler):
             self.logger.error(f"Error extracting note data from popup: {str(e)}")
         
         return note_data
+    
+    async def _save_note_data(self, note_data: Dict[str, Any], note_index: int):
+        """Save note data to local storage directory"""
+        try:
+            # Create filename with timestamp and index
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"note_{note_index:02d}_{timestamp}.json"
+            filepath = self.storage_dir / filename
+            
+            # Save as JSON
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(note_data, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"Saved note data to: {filepath}")
+            
+            # Also save images list separately if needed
+            if note_data.get("images"):
+                images_file = self.storage_dir / f"note_{note_index:02d}_images.json"
+                with open(images_file, 'w', encoding='utf-8') as f:
+                    json.dump({"url": note_data.get("url"), "images": note_data["images"]}, 
+                            f, ensure_ascii=False, indent=2)
+            
+            return str(filepath)
+        except Exception as e:
+            self.logger.error(f"Error saving note data: {str(e)}")
+            return None
     
     async def _close_popup(self, page: Page):
         """Close popup by clicking outside of it"""
@@ -1005,10 +1219,14 @@ class RedNoteCrawler(BaseCrawler):
         
         try:
             # Configure browser (non-headless for manual interactions)
+            # Use persistent context to save browser state (cookies, localStorage, login session)
             browser_config = BrowserConfig(
                 headless=kwargs.get("headless", False),  # Non-headless for login/verification
                 verbose=kwargs.get("verbose", True),
-                browser_type=kwargs.get("browser_type", "chromium")
+                browser_type=kwargs.get("browser_type", "chromium"),
+                use_persistent_context=True,  # Enable persistent browser context
+                user_data_dir=str(self.browser_data_dir),  # Save browser state to this directory
+                use_managed_browser=True  # Required for persistent context
             )
             
             # Initialize crawler
@@ -1125,10 +1343,17 @@ class RedNoteCrawler(BaseCrawler):
                     note_data = await self._extract_note_data_from_popup(self.page)
                     note_data["url"] = self.page.url
                     note_data["note_index"] = i
+                    note_data["crawled_at"] = datetime.now().isoformat()
+                    
+                    # Save note data to local storage
+                    saved_path = await self._save_note_data(note_data, i)
+                    if saved_path:
+                        note_data["saved_path"] = saved_path
+                    
                     results["notes"].append(note_data)
                     
-                    self.logger.info(f"Extracted note {i}: {len(note_data['images'])} images, "
-                                   f"{len(note_data['text'])} chars, {len(note_data['comments'])} comments")
+                    self.logger.info(f"Extracted note {i}: {len(note_data.get('images', []))} images, "
+                                   f"{len(note_data.get('text', ''))} chars, {len(note_data.get('comments', []))} comments")
                     
                     # Close popup by clicking outside
                     await self._close_popup(self.page)
@@ -1150,6 +1375,34 @@ class RedNoteCrawler(BaseCrawler):
             
             results["success"] = True
             results["total_notes"] = len(results["notes"])
+            results["storage_dir"] = str(self.storage_dir)
+            
+            # Save summary file
+            summary_file = self.storage_dir / "summary.json"
+            summary = {
+                "search_keyword": search_keyword,
+                "total_notes": len(results["notes"]),
+                "crawled_at": datetime.now().isoformat(),
+                "storage_dir": str(self.storage_dir),
+                "notes": [
+                    {
+                        "index": note.get("note_index"),
+                        "url": note.get("url"),
+                        "images_count": len(note.get("images", [])),
+                        "text_length": len(note.get("text", "")),
+                        "comments_count": len(note.get("comments", [])),
+                        "saved_path": note.get("saved_path")
+                    }
+                    for note in results["notes"]
+                ]
+            }
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"\n=== Crawling Complete ===")
+            self.logger.info(f"Total notes crawled: {len(results['notes'])}")
+            self.logger.info(f"Data saved to: {self.storage_dir}")
+            self.logger.info(f"Summary file: {summary_file}")
             
         except Exception as e:
             self.logger.error(f"Crawler error: {str(e)}")
