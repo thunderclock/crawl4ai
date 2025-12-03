@@ -56,9 +56,9 @@ async def main():
         print("=" * 70)
         
         result = await crawler.run(
-            search_keyword="牛奶",
-            max_notes=5,
-            headless=False,  # 非无头模式，可以看到浏览器
+            search_keyword="宁夏 酸奶",
+            max_notes=20,
+            headless=True,  # 非无头模式，可以看到浏览器
             verbose=True
         )
         

@@ -15,6 +15,7 @@ import aiohttp
 import random
 import os
 import tempfile
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pathlib import Path
@@ -23,6 +24,7 @@ from crawl4ai import BrowserConfig, AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
 from crawl4ai.hub import BaseCrawler
 from crawl4ai.async_logger import AsyncLogger
+from .minio_storage import MinioStorageManager
 
 
 __meta__ = {
@@ -49,7 +51,15 @@ class RedNoteCrawler(BaseCrawler):
         llm_config: Optional[LLMConfig] = None,
         use_llm_extraction: bool = True,
         storage_dir: Optional[str] = None,
-        browser_data_dir: Optional[str] = None
+        browser_data_dir: Optional[str] = None,
+        # Minio configuration
+        minio_endpoint: Optional[str] = None,
+        minio_access_key: Optional[str] = None,
+        minio_secret_key: Optional[str] = None,
+        minio_bucket: str = "rednote-browser-state",
+        minio_secure: bool = True,
+        minio_region: Optional[str] = None,
+        minio_profile_name: str = "default"
     ):
         """
         Initialize RedNote crawler
@@ -61,6 +71,13 @@ class RedNoteCrawler(BaseCrawler):
             storage_dir: Directory to store crawled data (default: temp directory)
             browser_data_dir: Directory to store browser state (cookies, localStorage, etc.)
                              If None, uses ~/.crawl4ai/rednote_browser_profile
+            minio_endpoint: Minio server endpoint (e.g., 'localhost:9000')
+            minio_access_key: Minio access key
+            minio_secret_key: Minio secret key
+            minio_bucket: Minio bucket name (default: 'rednote-browser-state')
+            minio_secure: Use HTTPS for Minio (default: True)
+            minio_region: Minio region name (optional)
+            minio_profile_name: Profile name for browser state in Minio (default: 'default')
         """
         super().__init__()
         self.feishu_webhook_url = feishu_webhook_url
@@ -93,6 +110,80 @@ class RedNoteCrawler(BaseCrawler):
         
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Data will be stored in: {self.storage_dir}")
+        
+        # Setup Minio storage manager if configured
+        self.minio_storage: Optional[MinioStorageManager] = None
+        self.minio_profile_name = minio_profile_name
+        if minio_endpoint and minio_access_key and minio_secret_key:
+            try:
+                self.minio_storage = MinioStorageManager(
+                    endpoint=minio_endpoint,
+                    access_key=minio_access_key,
+                    secret_key=minio_secret_key,
+                    bucket_name=minio_bucket,
+                    secure=minio_secure,
+                    region=minio_region,
+                    logger=self.logger
+                )
+                self.logger.info(f"Minio storage enabled: {minio_endpoint}/{minio_bucket}")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Minio storage: {str(e)}")
+                self.minio_storage = None
+    
+    async def _save_browser_state_to_minio(self):
+        """Save browser state to Minio if configured"""
+        if not self.minio_storage or not self.crawler:
+            return
+        
+        try:
+            # Get browser context
+            strategy = self.crawler.crawler_strategy
+            if hasattr(strategy, 'default_context') and strategy.default_context:
+                context = strategy.default_context
+                
+                # Export storage state
+                storage_state = await context.storage_state()
+                
+                # Save to Minio
+                await self.minio_storage.save_browser_state(
+                    storage_state=storage_state,
+                    browser_data_dir=self.browser_data_dir,
+                    profile_name=self.minio_profile_name
+                )
+                
+                self.logger.info("Browser state saved to Minio successfully")
+        except Exception as e:
+            self.logger.warning(f"Failed to save browser state to Minio: {str(e)}")
+    
+    async def _load_browser_state_from_minio(self) -> bool:
+        """Load browser state from Minio if configured and available"""
+        if not self.minio_storage:
+            return False
+        
+        try:
+            # Try to load browser data directory first
+            loaded = await self.minio_storage.load_browser_data_dir(
+                target_dir=self.browser_data_dir,
+                profile_name=self.minio_profile_name,
+                use_latest=True
+            )
+            
+            if loaded:
+                self.logger.info("Browser data directory loaded from Minio")
+            
+            # Try to load storage state
+            storage_state = await self.minio_storage.load_storage_state(
+                profile_name=self.minio_profile_name
+            )
+            
+            if storage_state:
+                self.logger.info("Storage state loaded from Minio")
+                return True
+            
+            return loaded
+        except Exception as e:
+            self.logger.warning(f"Failed to load browser state from Minio: {str(e)}")
+            return False
     
     async def _random_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Add random delay between 1-3 seconds (or custom range) to simulate human behavior"""
@@ -365,8 +456,35 @@ class RedNoteCrawler(BaseCrawler):
             # Navigate to RedNote homepage first (if not already there)
             if "xiaohongshu.com" not in page.url or "/search" in page.url:
                 self.logger.info("Navigating to RedNote homepage...")
-                await page.goto(self.base_url, wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(2)
+                await page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
+                
+                # Wait for search box to appear instead of waiting for network idle
+                self.logger.info("Waiting for search box to appear...")
+                search_box_selectors = [
+                    'input[placeholder*="搜索"]',
+                    'input[placeholder*="搜索笔记"]',
+                    'input[type="search"]',
+                    'input[class*="search"]',
+                    '.search-input input',
+                    '[class*="search"] input',
+                    'input[aria-label*="搜索"]',
+                    'input[name*="search"]',
+                    'input[id*="search"]'
+                ]
+                
+                search_box_found = False
+                for selector in search_box_selectors:
+                    try:
+                        await page.wait_for_selector(selector, state="visible", timeout=30000)
+                        self.logger.info(f"Search box appeared: {selector}")
+                        search_box_found = True
+                        break
+                    except Exception:
+                        continue
+                
+                if not search_box_found:
+                    self.logger.warning("Search box not found immediately, continuing anyway...")
+                    await asyncio.sleep(2)
             
             # Check for captcha
             if await self._detect_captcha(page):
@@ -1088,26 +1206,105 @@ class RedNoteCrawler(BaseCrawler):
         
         return note_data
     
+    async def _download_image(self, image_url: str, save_path: Path) -> Optional[str]:
+        """Download an image from URL and save to local path"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        # Get file extension from content-type or URL
+                        content_type = response.headers.get('Content-Type', '').lower()
+                        if 'jpeg' in content_type or 'jpg' in content_type:
+                            ext = '.jpg'
+                        elif 'png' in content_type:
+                            ext = '.png'
+                        elif 'webp' in content_type:
+                            ext = '.webp'
+                        elif 'gif' in content_type:
+                            ext = '.gif'
+                        else:
+                            # Try to get extension from URL
+                            url_ext = Path(image_url.split('?')[0]).suffix.lower()
+                            if url_ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                                ext = url_ext
+                            else:
+                                ext = '.jpg'  # Default to jpg
+                        
+                        # Update save_path with correct extension if needed
+                        if save_path.suffix.lower() != ext:
+                            save_path = save_path.with_suffix(ext)
+                        
+                        # Save image
+                        image_data = await response.read()
+                        with open(save_path, 'wb') as f:
+                            f.write(image_data)
+                        
+                        self.logger.info(f"Downloaded image: {save_path.name} ({len(image_data)} bytes)")
+                        return str(save_path)
+                    else:
+                        self.logger.warning(f"Failed to download image {image_url}: HTTP {response.status}")
+                        return None
+        except Exception as e:
+            self.logger.warning(f"Error downloading image {image_url}: {str(e)}")
+            return None
+    
     async def _save_note_data(self, note_data: Dict[str, Any], note_index: int):
-        """Save note data to local storage directory"""
+        """Save note data to local storage directory and download images"""
         try:
             # Create filename with timestamp and index
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"note_{note_index:02d}_{timestamp}.json"
             filepath = self.storage_dir / filename
             
+            # Create images directory for this note
+            images_dir = self.storage_dir / f"note_{note_index:02d}_{timestamp}_images"
+            images_dir.mkdir(exist_ok=True)
+            
+            # Download and save images
+            downloaded_images = []
+            if note_data.get("images"):
+                self.logger.info(f"Downloading {len(note_data['images'])} images for note {note_index}...")
+                for img_idx, image_url in enumerate(note_data["images"], 1):
+                    try:
+                        # Create image filename (extension will be determined during download)
+                        image_filename_base = f"image_{img_idx:02d}"
+                        image_path = images_dir / image_filename_base
+                        
+                        # Download image (extension will be added based on content type)
+                        downloaded_path = await self._download_image(image_url, image_path)
+                        if downloaded_path:
+                            downloaded_path_obj = Path(downloaded_path)
+                            downloaded_images.append({
+                                "original_url": image_url,
+                                "local_path": str(downloaded_path_obj.relative_to(self.storage_dir)),
+                                "filename": downloaded_path_obj.name,
+                                "index": img_idx
+                            })
+                    except Exception as e:
+                        self.logger.warning(f"Error downloading image {img_idx}: {str(e)}")
+                        continue
+                
+                # Update note_data with local image paths
+                note_data["downloaded_images"] = downloaded_images
+                note_data["images_dir"] = str(images_dir.relative_to(self.storage_dir))
+            
             # Save as JSON
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(note_data, f, ensure_ascii=False, indent=2)
             
             self.logger.info(f"Saved note data to: {filepath}")
+            if downloaded_images:
+                self.logger.info(f"Downloaded {len(downloaded_images)} images to: {images_dir}")
             
             # Also save images list separately if needed
             if note_data.get("images"):
                 images_file = self.storage_dir / f"note_{note_index:02d}_images.json"
                 with open(images_file, 'w', encoding='utf-8') as f:
-                    json.dump({"url": note_data.get("url"), "images": note_data["images"]}, 
-                            f, ensure_ascii=False, indent=2)
+                    json.dump({
+                        "url": note_data.get("url"), 
+                        "images": note_data["images"],
+                        "downloaded_images": downloaded_images
+                    }, f, ensure_ascii=False, indent=2)
             
             return str(filepath)
         except Exception as e:
@@ -1117,50 +1314,111 @@ class RedNoteCrawler(BaseCrawler):
     async def _close_popup(self, page: Page):
         """Close popup by clicking outside of it"""
         try:
-            # Click on a non-popup area (e.g., background overlay or outside the popup)
-            # Try clicking on the overlay/backdrop first
-            overlay_selectors = [
+            # First, try pressing Escape key (most reliable)
+            try:
+                await page.keyboard.press('Escape')
+                await asyncio.sleep(0.5)
+                self.logger.info("Closed popup by pressing Escape")
+            except Exception:
+                pass
+            
+            # Try clicking on the mask/overlay elements (including note-detail-mask)
+            mask_selectors = [
+                '[class*="note-detail-mask"]',
+                '[class*="mask"]',
                 '.modal-backdrop',
                 '.overlay',
                 '.backdrop',
                 '[class*="backdrop"]',
-                '[class*="overlay"]'
+                '[class*="overlay"]',
+                '[class*="modal"]'
             ]
             
-            for selector in overlay_selectors:
+            for selector in mask_selectors:
                 try:
-                    overlay = await page.query_selector(selector)
-                    if overlay and await overlay.is_visible():
-                        await self._random_delay(1, 3)
-                        await overlay.click()
-                        await asyncio.sleep(0.5)
-                        self.logger.info("Closed popup by clicking overlay")
-                        return True
+                    mask = await page.query_selector(selector)
+                    if mask:
+                        is_visible = await mask.is_visible()
+                        if is_visible:
+                            # Try clicking the mask directly
+                            try:
+                                await mask.click(timeout=2000)
+                                await asyncio.sleep(0.5)
+                                self.logger.info(f"Closed popup by clicking mask: {selector}")
+                            except Exception:
+                                # If click fails, try clicking at center of mask
+                                try:
+                                    box = await mask.bounding_box()
+                                    if box:
+                                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                                        await asyncio.sleep(0.5)
+                                        self.logger.info(f"Closed popup by clicking mask center: {selector}")
+                                except Exception:
+                                    pass
+                except Exception:
+                    continue
+            
+            # Wait for mask to disappear
+            await asyncio.sleep(1)
+            
+            # Verify mask is gone by checking if it's still visible
+            for selector in mask_selectors:
+                try:
+                    mask = await page.query_selector(selector)
+                    if mask:
+                        is_visible = await mask.is_visible()
+                        if is_visible:
+                            # Mask still visible, try Escape again
+                            await page.keyboard.press('Escape')
+                            await asyncio.sleep(1)
+                            self.logger.info(f"Mask still visible, pressed Escape again: {selector}")
                 except Exception:
                     continue
             
             # If no overlay found, click on a safe area (top-left corner of page)
             try:
-                await self._random_delay(1, 3)
-                await page.click('body', position={'x': 10, 'y': 10})
+                await page.click('body', position={'x': 10, 'y': 10}, timeout=2000)
                 await asyncio.sleep(0.5)
                 self.logger.info("Closed popup by clicking page background")
-                return True
             except Exception:
                 pass
             
-            # Try pressing Escape key
-            try:
-                await page.keyboard.press('Escape')
-                await asyncio.sleep(0.5)
-                self.logger.info("Closed popup by pressing Escape")
-                return True
-            except Exception:
-                pass
-            
-            return False
+            return True
         except Exception as e:
             self.logger.warning(f"Error closing popup: {str(e)}")
+            return False
+    
+    async def _wait_for_popup_to_close(self, page: Page, timeout: int = 5):
+        """Wait for popup/mask to completely disappear"""
+        try:
+            mask_selectors = [
+                '[class*="note-detail-mask"]',
+                '[class*="mask"]',
+                '.modal-backdrop',
+                '[class*="backdrop"]'
+            ]
+            
+            start_time = time.time()
+            while (time.time() - start_time) < timeout:
+                all_closed = True
+                for selector in mask_selectors:
+                    try:
+                        mask = await page.query_selector(selector)
+                        if mask:
+                            is_visible = await mask.is_visible()
+                            if is_visible:
+                                all_closed = False
+                                break
+                    except Exception:
+                        pass
+                
+                if all_closed:
+                    return True
+                
+                await asyncio.sleep(0.2)
+            
+            return False
+        except Exception:
             return False
     
     async def _extract_note_data(self, page: Page) -> Dict[str, Any]:
@@ -1218,6 +1476,11 @@ class RedNoteCrawler(BaseCrawler):
         }
         
         try:
+            # Try to load browser state from Minio before initializing browser
+            if self.minio_storage:
+                self.logger.info("Attempting to load browser state from Minio...")
+                await self._load_browser_state_from_minio()
+            
             # Configure browser (non-headless for manual interactions)
             # Use persistent context to save browser state (cookies, localStorage, login session)
             browser_config = BrowserConfig(
@@ -1242,15 +1505,40 @@ class RedNoteCrawler(BaseCrawler):
             # Navigate to RedNote
             start_url = url or self.base_url
             self.logger.info(f"Navigating to: {start_url}")
-            await self.page.goto(start_url, wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(2)
+            await self.page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+            
+            # Wait for page key elements to appear instead of waiting for network idle
+            self.logger.info("Waiting for page to be ready...")
+            try:
+                # Try to wait for search box or any common page element
+                search_selectors = [
+                    'input[placeholder*="搜索"]',
+                    'input[placeholder*="搜索笔记"]',
+                    'input[type="search"]',
+                    'body'  # Fallback to body element
+                ]
+                for selector in search_selectors:
+                    try:
+                        await self.page.wait_for_selector(selector, state="visible", timeout=30000)
+                        self.logger.info(f"Page element appeared: {selector}")
+                        break
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.logger.warning(f"Timeout waiting for elements, continuing anyway: {e}")
+            
+            await asyncio.sleep(1)  # Brief pause for page to stabilize
             
             # Check for captcha on initial page
             if await self._detect_captcha(self.page):
                 await self._handle_verification(self.page)
+                # Save browser state after verification (cookies may have been updated)
+                await self._save_browser_state_to_minio()
             
             # Check if login is needed
             await self._login_if_needed(self.page)
+            # Save browser state after login (session cookies are set)
+            await self._save_browser_state_to_minio()
             
             # Search for content
             if not await self._search_content(self.page, search_keyword):
@@ -1312,23 +1600,80 @@ class RedNoteCrawler(BaseCrawler):
             
             self.logger.info(f"Found {len(note_elements)} potential note elements")
             
-            # Get first 5 notes (first row)
-            first_row_notes = note_elements[:5]
-            self.logger.info(f"Processing first row: {len(first_row_notes)} notes")
+            # Store the selector that worked for re-finding elements
+            working_selector = None
+            for selector in note_selectors:
+                try:
+                    elements = await self.page.query_selector_all(selector)
+                    if elements and len(elements) > 0:
+                        working_selector = selector
+                        break
+                except Exception:
+                    continue
+            
+            # If no selector worked, use fallback strategy
+            if not working_selector:
+                working_selector = 'a, div[class*="item"], div[class*="card"]'
+            
+            max_notes_to_process = min(max_notes, len(note_elements))
+            self.logger.info(f"Processing first {max_notes_to_process} notes")
             
             # Crawl each note by clicking on it and extracting from popup
-            for i, note_element in enumerate(first_row_notes, 1):
+            # Re-find elements in each iteration to avoid stale element references
+            for i in range(1, max_notes_to_process + 1):
                 try:
-                    self.logger.info(f"Crawling note {i}/5 in first row")
+                    self.logger.info(f"Crawling note {i}/{max_notes_to_process} in first row")
+                    
+                    # Ensure previous popup is completely closed (important for headless mode)
+                    if i > 1:
+                        self.logger.info(f"Ensuring previous popup is closed before processing note {i}...")
+                        await self._close_popup(self.page)
+                        await self._wait_for_popup_to_close(self.page, timeout=5)
+                        await asyncio.sleep(1)  # Additional wait for page to stabilize
+                    
+                    # Re-find note elements to avoid stale references after popup closes
+                    note_element = None
+                    try:
+                        elements = await self.page.query_selector_all(working_selector)
+                        if elements and len(elements) >= i:
+                            note_element = elements[i - 1]  # 0-indexed
+                        else:
+                            self.logger.warning(f"Could not find note element {i}, found {len(elements) if elements else 0} elements")
+                            continue
+                    except Exception as e:
+                        self.logger.warning(f"Error re-finding note element {i}: {str(e)}")
+                        continue
+                    
+                    # Check if element is still attached to DOM
+                    try:
+                        is_attached = await note_element.is_visible()
+                        if not is_attached:
+                            self.logger.warning(f"Note element {i} is not visible, skipping")
+                            continue
+                    except Exception:
+                        self.logger.warning(f"Note element {i} is not attached to DOM, skipping")
+                        continue
                     
                     # Scroll element into view
-                    await note_element.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.5)
+                    try:
+                        await note_element.scroll_into_view_if_needed(timeout=5000)
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        self.logger.warning(f"Could not scroll element {i} into view: {str(e)}, trying to continue...")
+                        # Try to continue anyway, element might still be clickable
                     
                     # Click the note element to open popup
+                    # Use force=True in headless mode to bypass interception
                     try:
                         await self._random_delay(1, 3)
-                        await note_element.click(timeout=5000)
+                        # Try normal click first
+                        try:
+                            await note_element.click(timeout=5000)
+                        except Exception:
+                            # If normal click fails, try force click (bypasses interception)
+                            self.logger.info(f"Normal click failed for note {i}, trying force click...")
+                            await note_element.click(force=True, timeout=5000)
+                        
                         await asyncio.sleep(2)  # Wait for popup to appear
                         self.logger.info(f"Clicked note {i}, waiting for popup...")
                     except Exception as e:
@@ -1357,7 +1702,9 @@ class RedNoteCrawler(BaseCrawler):
                     
                     # Close popup by clicking outside
                     await self._close_popup(self.page)
-                    await asyncio.sleep(1)  # Wait for popup to close
+                    # Wait for popup to completely close (important for headless mode)
+                    await self._wait_for_popup_to_close(self.page, timeout=5)
+                    await asyncio.sleep(1)  # Additional wait for page to stabilize
                     
                     self.logger.info(f"Note {i} completed, popup closed")
                         
@@ -1368,6 +1715,7 @@ class RedNoteCrawler(BaseCrawler):
                     # Try to close popup if it's still open
                     try:
                         await self._close_popup(self.page)
+                        await self._wait_for_popup_to_close(self.page, timeout=5)
                         await asyncio.sleep(1)
                     except Exception:
                         pass
@@ -1408,6 +1756,11 @@ class RedNoteCrawler(BaseCrawler):
             self.logger.error(f"Crawler error: {str(e)}")
             results["error"] = str(e)
         finally:
+            # Save browser state to Minio before closing
+            if self.minio_storage:
+                self.logger.info("Saving browser state to Minio before closing...")
+                await self._save_browser_state_to_minio()
+            
             if self.crawler:
                 await self.crawler.close()
         
